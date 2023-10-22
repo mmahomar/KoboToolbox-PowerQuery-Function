@@ -1,0 +1,238 @@
+let
+    Source = let
+    func = (AssetUID as any, Token as any, SurveyLanguage as any, ChoicesLanguage as any) => let
+	//Query 1: Assets
+    //Gets Survey Assets (i.e.: survey, choices, settings from XLS form)
+    Assets = Json.Document(Web.Contents("https://kf.kobotoolbox.org/api/v2/assets/", [RelativePath = AssetUID & "/?format=ssjson", Headers=[Authorization="Token " & Token]])),
+    
+    //Query 2: Survey
+    //Gets Survey (from Assests)
+    ASource = Assets,
+    ASurvey = ASource[survey],
+    //ExpandAllRecords Function
+    ExpandColumns = (TableToExpand as table, optional ColName as text, optional ColNumber as number) =>
+        let
+            //If the column number is missing, make it 0
+            ColumnNumber = if (ColNumber = null) then 0 else ColNumber, 
+            //Supplying a ColName parameter overrides the column-finding logic
+            ColumnName = 
+                if (ColName <> null) then
+                    ColName
+                else
+                    //Find the column name relating to the column number
+                    Table.ColumnNames(TableToExpand){ColumnNumber}, 
+            //Get a list containing all of the values in the column
+            ColumnContents = Table.Column(TableToExpand, ColumnName), 
+            //Iterate over each value in the column and then
+            //If the value is of type table get a list of all of the columns in the table
+            //Then get a distinct list of all of these column names
+            ColumnsToExpand = List.Distinct(
+                List.Combine(
+                    List.Transform(
+                        ColumnContents, 
+                        each if _ is record then Record.FieldNames(_) else {}
+                    )
+                )
+            ), 
+            //Append the original column name to the front of each of these column names
+            //NewColumnNames = List.Transform(ColumnsToExpand, each ColumnName & "." & _),
+            NewColumnNames = List.Transform(ColumnsToExpand, each _), 
+            //Is there anything to expand in this column?
+            CanExpandCurrentColumn = List.Count(ColumnsToExpand) > 0, 
+            //If this column can be expanded, then expand it
+            ExpandedTable = 
+                if CanExpandCurrentColumn then
+                    Table.ExpandRecordColumn(
+                        TableToExpand, 
+                        ColumnName, 
+                        ColumnsToExpand, 
+                        NewColumnNames
+                    )
+                else
+                    TableToExpand, 
+            //If the column has been expanded then keep the column number the same, otherwise add one to it
+            NextColumnNumber = if CanExpandCurrentColumn then ColumnNumber else ColumnNumber + 1, 
+            //If the column number is now greater than the number of columns in the table
+            //Then return the table as it is
+            //Else call the ExpandAll function recursively with the expanded table
+            OutputTable = 
+                if NextColumnNumber > (Table.ColumnCount(ExpandedTable) - 1) then
+                    ExpandedTable
+                else
+                    @ExpandColumns(ExpandedTable, null, NextColumnNumber)
+        in
+            OutputTable,
+    AConvertedTable = Table.FromList(ASurvey, Splitter.SplitByNothing(), null, null, ExtraValues.Error),
+    AExpandedAllRecords = ExpandColumns(AConvertedTable),
+    AAddedIndex = Table.AddIndexColumn(AExpandedAllRecords, "Index", 1, 1, Int64.Type),
+    AAddedGroupCounter = Table.AddColumn(AAddedIndex, "Group", each if [type] = "begin_group" then 1 else if [type] = "end_group" then -1 else 0),
+    AAddedGroupIdentifier = Table.AddColumn(AAddedGroupCounter, "GroupIdentifier", each List.Sum(List.FirstN(AAddedGroupCounter[Group],[Index]))), 
+    ARemovedOtherColumns = Table.SelectColumns(
+        AAddedGroupIdentifier, 
+        {"type", "name", "Index"}
+    ), 
+    AFilteredGroups = Table.SelectRows(ARemovedOtherColumns, each ([type] = "begin_group" or [type] = "end_group" or [type] = "start")),
+    AAddedEndIndex = Table.AddIndexColumn(AFilteredGroups, "EndGroupIndex", 0, 1, Int64.Type),
+    AAddedNewName = Table.AddColumn(AAddedEndIndex, "new_name", each if [type] = "end_group" and [name] is null then try AAddedEndIndex[name]{[EndGroupIndex]-1} otherwise null else [name]),
+    ARemovedColumns = Table.RemoveColumns(AAddedNewName,{"name", "EndGroupIndex"}),
+    ARenamedName = Table.RenameColumns(ARemovedColumns,{{"new_name", "name"}}),
+    AGroupsToRecords = Table.ToRecords(ARenamedName), 
+    AConcatenateGroups = List.Accumulate(
+        AGroupsToRecords, 
+        {}, 
+        (state, current) =>
+            state
+                & {
+                    Record.AddField(
+                        current, 
+                        "result",
+                        if current[type] = "start" then
+                            current[name]
+                        else if current[type]
+                            = "begin_group"
+                                and (
+                                    List.Last(state)[type]
+                                        <> "begin_group" 
+                                    and 
+                                    List.Last(state)[type]
+                                        <> "end_group"
+                                )
+                        then
+                            current[name]
+                        else if current[type]
+                            = "begin_group"
+                                and (
+                                    List.Last(state)[type]
+                                        = "begin_group" 
+                                    or 
+                                    List.Last(state)[type]
+                                        = "end_group"
+                                )
+                        then
+                            (
+                                if Text.Length(List.Last(state)[result]) <> 0
+                                then
+                                    List.Last(state)[result] & "/" & current[name]
+                                else
+                                    current[name]
+                            )
+                        else
+                            Text.BeforeDelimiter(
+                                List.Last(state)[result], 
+                                "/", 
+                                {0, RelativePosition.FromEnd}
+                            )
+                    )
+                }
+    ),
+    AConvertedToTable = Table.FromList(AConcatenateGroups, Splitter.SplitByNothing(), null, null, ExtraValues.Error),
+    AExpandedGroups = Table.ExpandRecordColumn(AConvertedToTable, "Column1", {"type", "name", "Index", "result"}, {"type", "name", "Index", "result"}),
+    AFilteredBeginEndGroups = Table.SelectRows(AExpandedGroups, each ([type] <> "start")), 
+    AMergedSurveySelf = Table.NestedJoin(
+        AAddedGroupIdentifier, 
+        {"Index"}, 
+        AFilteredBeginEndGroups, 
+        {"Index"}, 
+        "Merge", 
+        JoinKind.LeftOuter
+    ), 
+    AExpandedMerge = Table.ExpandTableColumn(AMergedSurveySelf, "Merge", {"result"}, {"GroupName"}), 
+    ASortedRows = Table.Sort(AExpandedMerge, {{"Index", Order.Ascending}}), 
+    AAddedFillDown = Table.FillDown(ASortedRows, {"GroupName"}), 
+    AAddedColumn = Table.AddColumn(
+        AAddedFillDown, 
+        "Column", 
+        each if [GroupIdentifier] >= 1 then [GroupName] & "/" & [name] else [name]
+    ), 
+    AFilteredBeginEndGroups2 = Table.SelectRows(
+        AAddedColumn, 
+        each ([type] <> "begin_group" and [type] <> "end_group")
+    ), 
+    AFilteredNull = Table.SelectRows(AFilteredBeginEndGroups2, each ([Column] <> null) and ([type] <> "note")),
+    AFilteredVersion = Table.SelectRows(AFilteredNull, each not Text.Contains([name], "_version_")),
+    Survey = AFilteredVersion,
+
+    //Query 3: Columns
+    CSource = Survey,
+    CRemovedOtherColumns = Table.SelectColumns(CSource,{"Column"}),
+    CColumnList = Text.Combine(List.Transform(CRemovedOtherColumns[Column], (x) => x) & {"_id", "_uuid", "_submission_time", "_validation_status"}, ","),
+    Columns = CColumnList,
+
+    //Query 4: Choices
+    DSource = Assets,
+    DSurvey = DSource[choices],
+    DConvertedToTable = Table.FromList(DSurvey, Splitter.SplitByNothing(), null, null, ExtraValues.Error),
+    DExpandedAllRecords = ExpandColumns(DConvertedToTable),
+    DChangedType = Table.TransformColumnTypes(DExpandedAllRecords,{{"list_name", type text}, {"name", type text}}),
+    Choices = DChangedType,
+
+    //Query 5: Select Columns
+    FSource = Survey,
+    FFilteredRows = Table.SelectRows(FSource, each Text.StartsWith([type], "select")),
+    FSplitColumnByDelimiter = Table.SplitColumn(FFilteredRows, "type", Splitter.SplitTextByDelimiter(" ", QuoteStyle.Csv), {"type", "list_name"}),
+    FChangedType = Table.TransformColumnTypes(FSplitColumnByDelimiter,{{"type", type text}, {"list_name", type text}}),
+    SurveySelectColumnTypes = FChangedType,
+
+    //Query 6: Select One Column Names Only
+    GSource = SurveySelectColumnTypes,
+    GFilteredRows = Table.SelectRows(GSource, each ([type] = "select_one")),
+    GRemovedOtherColumns = Table.SelectColumns(GFilteredRows,{"name"}),
+    GTransposedTable = Table.Transpose(GRemovedOtherColumns),
+    GPromotedHeaders = Table.PromoteHeaders(GTransposedTable, [PromoteAllScalars=true]),
+    GAddedCustom = Table.AddColumn(GPromotedHeaders, "_id", each ""),
+    SurveySelectOneColumnNames = GAddedCustom,
+
+    //Query 7: SurveySelectMultipleColumnNames
+    HSource = SurveySelectColumnTypes,
+    HFilteredRows = Table.SelectRows(HSource, each ([type] = "select_multiple")),
+    HRemovedOtherColumns = Table.SelectColumns(HFilteredRows,{"name"}),
+    HTransposedTable = Table.Transpose(HRemovedOtherColumns),
+    HPromotedHeaders = Table.PromoteHeaders(HTransposedTable, [PromoteAllScalars=true]),
+    HAddedCustom = Table.AddColumn(HPromotedHeaders, "_id", each ""),
+    SurveySelectMultipleColumnNames = HAddedCustom,
+
+    //Query 8: Survey Data Source
+    ISource = Json.Document(Web.Contents("https://kf.kobotoolbox.org/api/v2/assets/", [RelativePath = AssetUID & "/data/?format=json", Headers=[Authorization="Token " & Token]]), 65001),
+    IConvertedToTable = Table.FromRecords({ISource}),
+    IExpandedResults = Table.ExpandListColumn(IConvertedToTable, "results"),
+    IExpandedColumns = Table.ExpandRecordColumn(IExpandedResults, "results", Text.Split(Columns,",")),
+    IListedColumns = Table.FromList(Table.ColumnNames(IExpandedColumns), Splitter.SplitByNothing(), null, null, ExtraValues.Error),
+    IDuplicatedColumn = Table.DuplicateColumn(IListedColumns, "Column1", "Column2"),
+    IExtractedGroupNames = Table.TransformColumns(IDuplicatedColumn, {{"Column2", each Text.AfterDelimiter(_, "/", {0, RelativePosition.FromEnd}), type text}}),
+    IRenamedColumns = Table.RenameColumns(IExpandedColumns,Table.ToRows(IExtractedGroupNames),MissingField.Ignore),
+    SurveyDataSource = IRenamedColumns,
+
+    //Query 9: Multiple Choice
+    SSource = SurveyDataSource,
+    SSelectColumns = Table.SelectColumns(SSource, Table.ColumnNames(SurveySelectMultipleColumnNames)),
+    SUnpivotedOtherColumns = Table.UnpivotOtherColumns(SSelectColumns, {"_id"}, "variable_name", "value"),
+    SMergedWithSelectColumnTypes = Table.NestedJoin(SUnpivotedOtherColumns, {"variable_name"}, SurveySelectColumnTypes, {"name"}, "Survey Select Column Types", JoinKind.LeftOuter),
+    SExpandedSurveySelectColumnTypes = Table.ExpandTableColumn(SMergedWithSelectColumnTypes, "Survey Select Column Types", {"list_name", SurveyLanguage}, {"list_name", "variable_label"}),
+    SSplitValueByDelimeter = Table.ExpandListColumn(Table.TransformColumns(SExpandedSurveySelectColumnTypes, {{"value", Splitter.SplitTextByDelimiter(" ", QuoteStyle.Csv), let itemType = (type nullable text) meta [Serialized.Text = true] in type {itemType}}}), "value"),
+    SMergedWithChoices = Table.NestedJoin(SSplitValueByDelimeter, {"list_name", "value"}, Choices, {"list_name", "name"}, "Choices", JoinKind.LeftOuter),
+    SExpandedChoices = Table.ExpandTableColumn(SMergedWithChoices, "Choices", {ChoicesLanguage}, {"value_label"}),
+    SValidation = if Table.RowCount(SurveyDataSource) <> 0 then SExpandedChoices else "",
+    Data = SValidation
+   
+   in
+    Data
+
+// in
+//     Source
+,
+documentation = [
+  Documentation.Name = "FnGetKoboMultipleChoice",
+  Documentation.Description = "Gets Multiple Choice questions and responses (unpivoted) from a KoBo Toolbox Form using the API v2",
+  Documentation.LongDescription = "Get Multiple Choice questions and responses from a KoBo Toolbox Form using the API v2",
+  Documentation.Category = "Text",
+  Documentation.Examples = {[Description = "Returns Multiple Choice questions and responses from KoBo Toolbox using the API Token and Asset UID.",
+   Code = "FnGetSurveyData(""your-api-token"",""your-asset-uid"",""label"", ""label"").", 
+   Result = "To find your API Token go to #(lf)https://kf.kobotoolbox.org/token/?format=json
+   #(lf)#(lf)To find your form Asset UID go to #(lf)https://kf.kobotoolbox.org/api/v2/assets/
+   #(lf)#(lf)More information: https://support.kobotoolbox.org/api.html
+   #(lf)#(lf)To set the Survey language and Choices language, the default value is: label #(lf)If there are multiple languages in your survey set the corresponding values as: label::English (en)"]}
+ ]
+in
+ Value.ReplaceType(func, Value.ReplaceMetadata(Value.Type(func), documentation))
+in
+    Source
